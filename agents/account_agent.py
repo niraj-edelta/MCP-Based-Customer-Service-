@@ -1,3 +1,6 @@
+import re
+
+from agents.base import AgentResult
 from agents.base import BaseAgent
 
 SYSTEM_PROMPT = """
@@ -35,3 +38,44 @@ class AccountAgent(BaseAgent):
     name = "account_agent"
     allowed_tools = ["get_customer"]
     system_prompt = SYSTEM_PROMPT
+
+    def _extract_customer_id(self, task_brief: str, shared_state: dict) -> str | None:
+        match = re.search(r"\b(usr_\w+)\b", task_brief, re.IGNORECASE)
+        if match:
+            return match.group(1).lower()
+        if "customer_id" in shared_state:
+            return str(shared_state["customer_id"]).lower()
+        return None
+
+    async def run(self, task_brief: str, shared_state: dict) -> AgentResult:
+        tool_log = []
+        customer_id = self._extract_customer_id(task_brief, shared_state)
+
+        if not customer_id:
+            return AgentResult(
+                agent_name=self.name,
+                status="needs_input",
+                summary="Customer profile lookup needs a customer ID.",
+                needs_input_prompt="Could you please provide your customer ID?",
+                tool_log=tool_log,
+            )
+
+        result = await self._call_tool("get_customer", {"customer_id": customer_id})
+        tool_log.append({
+            "tool": "get_customer",
+            "arguments": {"customer_id": customer_id},
+            "result": result,
+        })
+
+        if result.startswith("Customer not found"):
+            summary = f"No data found for customer ID {customer_id}."
+        else:
+            summary = result
+
+        return AgentResult(
+            agent_name=self.name,
+            status="done",
+            summary=summary,
+            tool_log=tool_log,
+            state_updates={"customer_id": customer_id},
+        )

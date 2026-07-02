@@ -456,7 +456,7 @@ async def main():
 
                 for loop_index in range(max_loops):
                     response = chat(
-                        model="phi3:mini",
+                        model="llama3.2:3b",
                         messages=messages,
                         format="json",
                     )

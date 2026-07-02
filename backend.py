@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from ollama import chat as ollama_chat
 
@@ -204,6 +205,31 @@ class ChatResponse(BaseModel):
     shared_state: dict
 
 
+def build_agent_activity(agent_results: list) -> list[AgentActivity]:
+    return [
+        AgentActivity(
+            agent_name=r.agent_name,
+            status=r.status,
+            summary=r.summary,
+            tool_calls=[
+                ToolCallOut(tool=t["tool"], arguments=t["arguments"], result=t["result"])
+                for t in r.tool_log
+            ],
+        )
+        for r in agent_results
+    ]
+
+
+def sse_event(event: str, payload: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
+
+
+def model_to_dict(model):
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return model.dict()
+
+
 async def execute_tool_single(tool_name: str, arguments: dict) -> str:
     try:
         result = await mcp_session.call_tool(tool_name, arguments)
@@ -315,24 +341,55 @@ async def chat_multi(request: ChatRequest):
     )
     multi_state["conversation_log"] += f"\nCustomer: {request.message}\nCoordinator: {reply}"
 
-    activity = [
-        AgentActivity(
-            agent_name=r.agent_name,
-            status=r.status,
-            summary=r.summary,
-            tool_calls=[
-                ToolCallOut(tool=t["tool"], arguments=t["arguments"], result=t["result"])
-                for t in r.tool_log
-            ],
-        )
-        for r in agent_results
-    ]
+    activity = build_agent_activity(agent_results)
 
     return ChatResponse(
         reply=reply,
         agent_activity=activity,
         shared_state=multi_state["shared_state"],
     )
+
+
+@app.post("/chat/multi/stream")
+async def chat_multi_stream(request: ChatRequest):
+    if coordinator is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+
+    async def event_generator():
+        try:
+            turn = await coordinator.prepare_turn(
+                multi_state["conversation_log"],
+                multi_state["shared_state"],
+                request.message,
+            )
+            activity = build_agent_activity(turn.agent_results)
+            yield sse_event("activity", {
+                "agent_activity": [model_to_dict(item) for item in activity],
+                "shared_state": turn.shared_state,
+            })
+
+            chunks = []
+            for chunk in coordinator.synthesize_stream(
+                request.message,
+                turn.agent_results,
+                turn.reply_context,
+            ):
+                chunks.append(chunk)
+                yield sse_event("token", {"text": chunk})
+
+            reply = "".join(chunks).strip()
+            multi_state["shared_state"] = turn.shared_state
+            multi_state["conversation_log"] += f"\nCustomer: {request.message}\nCoordinator: {reply}"
+
+            yield sse_event("done", {
+                "reply": reply,
+                "agent_activity": [model_to_dict(item) for item in activity],
+                "shared_state": multi_state["shared_state"],
+            })
+        except Exception as exc:
+            yield sse_event("error", {"message": str(exc)})
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.post("/reset")

@@ -1,3 +1,6 @@
+import re
+
+from agents.base import AgentResult
 from agents.base import BaseAgent
 
 SYSTEM_PROMPT = """
@@ -22,9 +25,7 @@ Step 1 — Check eligibility:
 - If NOT_ELIGIBLE: report reason, done. (Coordinator will offer escalation)
 - If ELIGIBLE: proceed to Step 2
 
-Step 2 — Check if already refunded:
-- check_refund_policy returning "already refunded" means NOT_ELIGIBLE
-- If already refunded: tell customer, done.
+
 
 Step 3 — Check order amount:
 - Call get_order_amount(order_id)
@@ -86,3 +87,103 @@ class RefundsAgent(BaseAgent):
     name = "refunds_agent"
     allowed_tools = ["check_refund_policy", "process_refund", "get_order_amount"]
     system_prompt = SYSTEM_PROMPT
+
+    def _extract_order_ids(self, text: str, shared_state: dict) -> list[str]:
+        ids = []
+        for match in re.findall(r"\bORD\s*-?\s*(\d{3,6})\b", text, re.IGNORECASE):
+            ids.append(f"ORD{match}")
+        for match in re.findall(r"\b(?<!ORD)(\d{3,6})\b", text, re.IGNORECASE):
+            ids.append(f"ORD{match}")
+
+        for order_id in shared_state.get("order_ids", []) or []:
+            ids.append(str(order_id).upper())
+        if "order_id" in shared_state:
+            ids.append(str(shared_state["order_id"]).upper())
+
+        normalized = []
+        for order_id in ids:
+            order_id = str(order_id).strip().upper()
+            if re.fullmatch(r"\d{3,6}", order_id):
+                order_id = f"ORD{order_id}"
+            normalized.append(order_id)
+        return list(dict.fromkeys(normalized))
+
+    async def _check_one(self, order_id: str, tool_log: list) -> tuple[str, dict]:
+        policy = await self._call_tool("check_refund_policy", {"order_id": order_id})
+        tool_log.append({
+            "tool": "check_refund_policy",
+            "arguments": {"order_id": order_id},
+            "result": policy,
+        })
+
+        if policy.startswith("NOT_ELIGIBLE"):
+            reason = policy.split(":", 1)[1].strip() if ":" in policy else policy
+            return f"{order_id}: Not eligible for refund - {reason}.", {"order_id": order_id}
+
+        if policy != "ELIGIBLE":
+            return f"{order_id}: {policy}.", {"order_id": order_id}
+
+        amount = await self._call_tool("get_order_amount", {"order_id": order_id})
+        tool_log.append({
+            "tool": "get_order_amount",
+            "arguments": {"order_id": order_id},
+            "result": amount,
+        })
+
+        try:
+            amount_value = float(amount)
+        except ValueError:
+            return f"{order_id}: Eligible for refund, but I could not verify the amount ({amount}).", {"order_id": order_id}
+
+        if amount_value > 500:
+            return (
+                f"{order_id}: Eligible by policy, but the ${amount_value:.2f} amount exceeds "
+                "$500 and needs human approval."
+            ), {"order_id": order_id}
+
+        return (
+            f"{order_id}: Eligible for refund for ${amount_value:.2f}. "
+            "Please confirm if you want this refund processed."
+        ), {"order_id": order_id}
+
+    async def run(self, task_brief: str, shared_state: dict) -> AgentResult:
+        tool_log = []
+        order_ids = self._extract_order_ids(task_brief, shared_state)
+
+        if not order_ids:
+            return AgentResult(
+                agent_name=self.name,
+                status="needs_input",
+                summary="No order ID available for refund eligibility.",
+                needs_input_prompt="Could you please provide the order ID you want checked for a refund?",
+                tool_log=tool_log,
+            )
+
+        if "confirmed" in task_brief.lower() and len(order_ids) == 1:
+            order_id = order_ids[0]
+            result = await self._call_tool("process_refund", {"order_id": order_id})
+            tool_log.append({
+                "tool": "process_refund",
+                "arguments": {"order_id": order_id},
+                "result": result,
+            })
+            return AgentResult(
+                agent_name=self.name,
+                status="done",
+                summary=result,
+                tool_log=tool_log,
+                state_updates={"order_id": order_id, "order_ids": order_ids},
+            )
+
+        summaries = []
+        for order_id in order_ids:
+            summary, _ = await self._check_one(order_id, tool_log)
+            summaries.append(summary)
+
+        return AgentResult(
+            agent_name=self.name,
+            status="done",
+            summary="Refund eligibility: " + " ".join(summaries),
+            tool_log=tool_log,
+            state_updates={"order_id": order_ids[0], "order_ids": order_ids},
+        )
